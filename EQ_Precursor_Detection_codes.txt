@@ -1,0 +1,538 @@
+% ================================================================
+%  SEISMO-IONOSPHERIC PRECURSOR DETECTION
+%  Adapted from: Akyol et al. (2020), Radio Science, 55, e2019RS006931
+%
+%  Pipeline:
+%   §2  Day-block statistical feature extraction (25+NC features/day)
+%   §3  SKLD anomaly signals — 9 channels (Akyol Eq. 8)
+%   §4  Internal empirical thresholding — Baseline: Day -5,-4,-3 (Akyol §3.3)
+%   §5  LOEO-SVM classification (Akyol §3.5)
+%   §6  ROC + MCC evaluation (Akyol Eq. 29)
+%   §7  Save: .mat workspace + Excel tables + .fig files
+%
+%  Requirements: Statistics and Machine Learning Toolbox
+% ================================================================
+
+clear; clc; close all;
+
+%% --- §0. USER SETTINGS -------------------------------------------------
+DATA_DIR = '';   % <==== ENTER FOLDER PATH HERE
+
+SAMPLES_PER_DAY = 576;
+PRE_ROWS        = 576 * 5;
+HIST_BINS       = 30;
+SVM_C           = 10;
+N_PERM          = 30;
+SEED            = 42;
+rng(SEED);
+
+CHANNELS = {'Lat_diff','Lon_diff','Height_diff','ClockOffset', ...
+            'TRODRY','TROWET','TGNTOT','TGETOT','TEC'};
+
+% Unicode characters — renders correctly in all figure elements
+D   = char(916);   % Delta
+phi = char(966);   % phi
+lam = char(955);   % lambda
+
+CH_LABELS = {[D phi], [D lam], [D 'h'], ...
+             'Clock Offset','Dry Troposphere','Wet Troposphere', ...
+             'Tropo Gradient N','Tropo Gradient E','TEC'};
+NC   = numel(CHANNELS);
+DAYS = -5:0;
+
+%% --- §1. EARTHQUAKE CATALOGUE ------------------------------------------
+catalog(1).name = 'ECUADOR 2016';
+catalog(1).file = fullfile(DATA_DIR, 'ECUADOR_2016_ALL.xlsx');
+catalog(1).sta  = {'ESMR', 'QUI3'};
+
+catalog(2).name = 'JAPAN 2011';
+catalog(2).file = fullfile(DATA_DIR, 'JAPAN_2011_ALL.xlsx');
+catalog(2).sta  = {'0036', '0550', '0918'};
+
+catalog(3).name = 'JAPAN 2024';
+catalog(3).file = fullfile(DATA_DIR, 'JAPAN_2024_ALL.xlsx');
+catalog(3).sta  = {'253', '574', '972'};
+
+catalog(4).name = 'MARAS 2023';
+catalog(4).file = fullfile(DATA_DIR, 'MARAS_2023_ALL.xlsx');
+catalog(4).sta  = {'ANTE', 'MAR1'};
+
+catalog(5).name = 'MAYOTTE 2018';
+catalog(5).file = fullfile(DATA_DIR, 'MAYOTTE_2018_ALL.xlsx');
+catalog(5).sta  = {'MAYG'};
+
+catalog(6).name = 'CHILE 2010';
+catalog(6).file = fullfile(DATA_DIR, 'CHILE_2010_ALL.xlsx');
+catalog(6).sta  = {'ANTC', 'SANT'};
+
+N_EQ = numel(catalog);
+
+%% --- §2. DATA LOADING + FEATURE EXTRACTION -----------------------------
+fprintf('=== §2: Data loading and feature extraction ===\n');
+
+MAX_R  = 200;
+MAX_S  = 20;
+
+X_feat = nan(MAX_R, NC*4 + 1 + NC);
+y_lbl  = nan(MAX_R, 1);
+eq_ids = nan(MAX_R, 1);
+day_vec= nan(MAX_R, 1);
+sta_arr= cell(MAX_R, 1);
+eq_arr = cell(MAX_R, 1);
+
+SKLD_mat     = nan(MAX_S, 6, NC);
+SKLD_eq_arr  = cell(MAX_S, 1);
+SKLD_sta_arr = cell(MAX_S, 1);
+
+feat_row = 0;
+skld_row = 0;
+
+for eq_i = 1:N_EQ
+    eq = catalog(eq_i);
+    fprintf('\n  [%d/%d] %s\n', eq_i, N_EQ, eq.name);
+
+    for si = 1:numel(eq.sta)
+        sta = eq.sta{si};
+
+        try
+            T = readtable(eq.file, 'Sheet', sta, 'VariableNamingRule', 'preserve');
+        catch
+            T = readtable(eq.file, 'Sheet', sta);
+        end
+        fprintf('    %s: %d rows\n', sta, height(T));
+
+        pre_T = T(1:PRE_ROWS, :);
+        eq_T  = T((PRE_ROWS+1):end, :);
+
+        day_blocks = cell(6, 1);
+        for d = 1:5
+            day_blocks{d} = pre_T((d-1)*SAMPLES_PER_DAY+1 : d*SAMPLES_PER_DAY, :);
+        end
+        day_blocks{6} = eq_T;
+
+        base_T = pre_T(1:(SAMPLES_PER_DAY*3), :);
+
+        skld_row = skld_row + 1;
+        SKLD_eq_arr{skld_row}  = eq.name;
+        SKLD_sta_arr{skld_row} = sta;
+
+        for d = 1:6
+            blk       = day_blocks{d};
+            day_label = DAYS(d);
+            feat_row  = feat_row + 1;
+
+            f_stat = nan(1, NC*4);
+            for ci = 1:NC
+                x = blk{:, CHANNELS{ci}};
+                x = x(isfinite(x));
+                if numel(x) >= 4
+                    idx = (ci-1)*4;
+                    f_stat(idx+1) = mean(x);
+                    f_stat(idx+2) = std(x);
+                    f_stat(idx+3) = skewness(x);
+                    f_stat(idx+4) = kurtosis(x);
+                end
+            end
+
+            skld_tec = compute_skld(blk{:,'TEC'}, base_T{:,'TEC'}, HIST_BINS);
+
+            skld_ch = nan(1, NC);
+            for ci = 1:NC
+                skld_ch(ci) = compute_skld( ...
+                    blk{:,CHANNELS{ci}}, base_T{:,CHANNELS{ci}}, HIST_BINS);
+            end
+            SKLD_mat(skld_row, d, :) = skld_ch;
+
+            X_feat(feat_row, :) = [f_stat, skld_tec, skld_ch];
+            y_lbl(feat_row)     = double(day_label >= -2);
+            eq_ids(feat_row)    = eq_i;
+            day_vec(feat_row)   = day_label;
+            sta_arr{feat_row}   = sta;
+            eq_arr{feat_row}    = eq.name;
+        end
+    end
+end
+
+valid   = ~isnan(y_lbl);
+X_feat  = X_feat(valid, :);
+y_lbl   = y_lbl(valid);
+eq_ids  = eq_ids(valid);
+day_vec = day_vec(valid);
+sta_arr = sta_arr(valid);
+eq_arr  = eq_arr(valid);
+
+SKLD_mat    = SKLD_mat(1:skld_row, :, :);
+SKLD_eq_arr = SKLD_eq_arr(1:skld_row);
+SKLD_sta_arr= SKLD_sta_arr(1:skld_row);
+
+X_feat(~isfinite(X_feat)) = 0;
+
+% Feature names (internal, ASCII)
+feat_names = {};
+for ci = 1:NC
+    feat_names{end+1} = [CHANNELS{ci} '_mean'];
+    feat_names{end+1} = [CHANNELS{ci} '_std'];
+    feat_names{end+1} = [CHANNELS{ci} '_skew'];
+    feat_names{end+1} = [CHANNELS{ci} '_kurt'];
+end
+feat_names{end+1} = 'TEC_SKLD';
+for ci = 1:NC
+    feat_names{end+1} = ['SKLD_' CHANNELS{ci}];
+end
+N_FEAT = numel(feat_names);
+
+% Display names: replace ENU codes with Unicode Greek symbols
+% char(916)=Delta, char(966)=phi, char(955)=lambda
+feat_disp = strrep(feat_names, 'Lat_diff',    [D phi]);
+feat_disp = strrep(feat_disp,  'Lon_diff',    [D lam]);
+feat_disp = strrep(feat_disp,  'Height_diff', [D 'h']);
+feat_disp = strrep(feat_disp, '_', ' ');
+
+fprintf('\n--- Dataset summary ---\n');
+fprintf('  Day-samples : %d\n', sum(valid));
+fprintf('  Features    : %d\n', N_FEAT);
+fprintf('  Label 0     : %d  (early: Day -5,-4,-3)\n', sum(y_lbl==0));
+fprintf('  Label 1     : %d  (pre-seismic + EQ: Day -2,-1,0)\n', sum(y_lbl==1));
+
+%% --- §3. SKLD ANOMALY TIMELINE -----------------------------------------
+fprintf('\n=== §3: SKLD anomaly timeline ===\n');
+
+baseline_ref = nan(skld_row, NC);
+for sri = 1:skld_row
+    for ci = 1:NC
+        baseline_ref(sri,ci) = nanmean(squeeze(SKLD_mat(sri,1:3,ci)));
+    end
+end
+
+colors_ch = lines(NC);
+
+fig1 = figure('Name','SKLD Anomaly Timeline', ...
+              'NumberTitle','off','Position',[30 30 1400 860]);
+
+for eq_i = 1:N_EQ
+    subplot(2,3,eq_i); hold on;
+
+    mask = strcmp(SKLD_eq_arr, catalog(eq_i).name);
+    if ~any(mask); continue; end
+
+    skld_sub = SKLD_mat(mask,:,:);
+    ref_sub  = baseline_ref(mask,:);
+    n_sta    = sum(mask);
+
+    skld_avg = squeeze(nanmean(skld_sub,1));
+    ref_mean = nanmean(ref_sub,1);
+    ref_std  = nanstd(ref_sub,0,1);
+
+    for ci = 1:NC
+        plot(DAYS, skld_avg(:,ci), ...
+             'Color',colors_ch(ci,:),'LineWidth',2.0, ...
+             'Marker','o','MarkerSize',6, ...
+             'DisplayName',CH_LABELS{ci});
+    end
+
+    xline(0, '--r','LineWidth',2.5,'HandleVisibility','off');
+    xline(-2,':k', 'LineWidth',1.5,'HandleVisibility','off');
+
+    ref_all = mean(ref_mean,'omitnan');
+    ref_s   = mean(ref_std,'omitnan');
+    yline(ref_all,'-','Color',[0.6 0.6 0.6],'LineWidth',1.2,'HandleVisibility','off');
+    patch([DAYS(1) DAYS(end) DAYS(end) DAYS(1)], ...
+          [ref_all-ref_s, ref_all-ref_s, ref_all+ref_s, ref_all+ref_s], ...
+          [0.85 0.85 0.85],'FaceAlpha',0.4,'EdgeColor','none', ...
+          'HandleVisibility','off');
+
+    xlabel('Day (EQ = 0)','FontSize',10);
+    ylabel('SKLD Anomaly Score','FontSize',10);
+    title(sprintf('%s  (%d station(s))',catalog(eq_i).name,n_sta), ...
+          'FontWeight','bold','FontSize',11);
+    legend('Location','best','FontSize',6,'NumColumns',2);
+    set(gca,'XTick',-5:0,'XLim',[-5.3 0.3],'GridAlpha',0.3,'FontSize',9);
+    grid on; box on;
+
+    fprintf('  %s: %d station(s)\n', catalog(eq_i).name, n_sta);
+end
+
+sgtitle('SKLD-Based Anomaly Signals — 9 GNSS Channels', ...
+        'FontSize',14,'FontWeight','bold');
+annotation('textbox',[0.01 0.01 0.98 0.04], ...
+    'String',['Red dashed: EQ day (Day 0)  |  Black dotted: Pre-seismic window onset (Day -2)  |  ' ...
+              'Grey band: Baseline mean ± std (Day -5,-4,-3)'], ...
+    'EdgeColor','none','FontSize',8,'HorizontalAlignment','center');
+
+%% --- §4. INTERNAL EMPIRICAL THRESHOLDING --------------------------------
+fprintf('\n=== §4: Empirical thresholding (Akyol §3.3) ===\n');
+TAIL_ALPHA = 0.05;
+
+fprintf('\n  Anomaly decisions (tail_p < %.2f):\n', TAIL_ALPHA);
+fprintf('  %-22s %-10s  Day-2  Day-1  Day0\n','EQ/Station','Channel');
+fprintf('  %s\n', repmat('-',1,55));
+
+anomaly_eq   = {};
+anomaly_sta  = {};
+anomaly_ch   = {};
+anomaly_tail = [];
+anomaly_dec  = [];
+
+for sri = 1:skld_row
+    for ci = 1:NC
+        base_v = squeeze(SKLD_mat(sri,1:3,ci));
+        base_v = base_v(isfinite(base_v));
+        test_v = squeeze(SKLD_mat(sri,4:6,ci));
+
+        tail_p = nan(3,1);
+        for ti = 1:3
+            if isfinite(test_v(ti)) && ~isempty(base_v)
+                tail_p(ti) = sum(base_v > test_v(ti)) / numel(base_v);
+            end
+        end
+        dec = tail_p < TAIL_ALPHA;
+
+        anomaly_eq{end+1}     = SKLD_eq_arr{sri};
+        anomaly_sta{end+1}    = SKLD_sta_arr{sri};
+        anomaly_ch{end+1}     = CHANNELS{ci};
+        anomaly_tail(end+1,:) = tail_p';
+        anomaly_dec(end+1,:)  = dec';
+
+        if any(dec)
+            fprintf('  %-22s %-10s  %5d  %5d  %5d\n', ...
+                [SKLD_eq_arr{sri} '/' SKLD_sta_arr{sri}], ...
+                CHANNELS{ci}, dec(1), dec(2), dec(3));
+        end
+    end
+end
+
+%% --- §5. LOEO-SVM CLASSIFICATION ----------------------------------------
+fprintf('\n=== §5: LOEO-SVM (Akyol §3.5) ===\n');
+fprintf('%-20s  %7s %7s    TP FN FP TN\n','Test Earthquake','AUC','MCC');
+fprintf('%s\n', repmat('-',1,55));
+
+fold_auc = nan(N_EQ,1);
+fold_mcc = nan(N_EQ,1);
+fold_fpr = cell(N_EQ,1);
+fold_tpr = cell(N_EQ,1);
+fold_fi  = zeros(N_EQ, N_FEAT);
+
+for fold = 1:N_EQ
+    tr = eq_ids ~= fold;
+    te = eq_ids == fold;
+
+    X_tr = X_feat(tr,:); y_tr = y_lbl(tr);
+    X_te = X_feat(te,:); y_te = y_lbl(te);
+
+    rng(SEED);
+    svm_mdl = fitcsvm(X_tr, y_tr, ...
+        'KernelFunction','rbf', ...
+        'BoxConstraint', SVM_C, ...
+        'KernelScale',   'auto', ...
+        'Standardize',   true);
+
+    try
+        svm_mdl  = fitPosterior(svm_mdl);
+        [~,sc]   = predict(svm_mdl, X_te);
+        pos_col  = find(svm_mdl.ClassNames == 1);
+        pos_sc   = sc(:, pos_col);
+    catch
+        [~,sc]   = predict(svm_mdl, X_te);
+        pos_sc   = sc(:, end);
+    end
+
+    y_pred = predict(svm_mdl, X_te);
+
+    [fpr_f,tpr_f,~,auc_f] = perfcurve(y_te, pos_sc, 1);
+    fold_fpr{fold} = fpr_f;
+    fold_tpr{fold} = tpr_f;
+    fold_auc(fold) = auc_f;
+    fold_mcc(fold) = compute_mcc(y_te, y_pred);
+
+    for fi = 1:N_FEAT
+        auc_p = nan(N_PERM,1);
+        for rr = 1:N_PERM
+            Xp = X_te;
+            Xp(:,fi) = Xp(randperm(size(Xp,1)),fi);
+            [~,sp] = predict(svm_mdl,Xp);
+            try; ps=sp(:,pos_col); catch; ps=sp(:,end); end
+            [~,~,~,auc_p(rr)] = perfcurve(y_te,ps,1);
+        end
+        fold_fi(fold,fi) = auc_f - nanmean(auc_p);
+    end
+
+    TP=sum(y_te==1&y_pred==1); FN=sum(y_te==1&y_pred~=1);
+    FP=sum(y_te~=1&y_pred==1); TN=sum(y_te~=1&y_pred~=1);
+    fprintf('%-20s  %7.3f %+7.3f    %2d %2d %2d %2d\n', ...
+        catalog(fold).name, auc_f, fold_mcc(fold), TP,FN,FP,TN);
+end
+
+fprintf('%s\n', repmat('-',1,55));
+fprintf('%-20s  %7.3f %+7.3f\n','MEAN', nanmean(fold_auc), nanmean(fold_mcc));
+
+%% --- §6. FIGURES --------------------------------------------------------
+eq_colors = lines(N_EQ);
+
+% Fig 2: ROC Curves
+fig2 = figure('Name','ROC Curves — LOEO-SVM', ...
+              'NumberTitle','off','Position',[80 80 700 620]);
+hold on;
+for fold = 1:N_EQ
+    plot(fold_fpr{fold}, fold_tpr{fold}, ...
+         'Color',eq_colors(fold,:),'LineWidth',2.2, ...
+         'DisplayName',sprintf('%s  (AUC=%.3f, MCC=%+.3f)', ...
+             catalog(fold).name, fold_auc(fold), fold_mcc(fold)));
+end
+plot([0 1],[0 1],'k--','LineWidth',1.5,'DisplayName','Random Guess (AUC=0.500)');
+annotation('textbox',[0.60 0.10 0.30 0.08], ...
+    'String',sprintf('Mean AUC = %.3f\nMean MCC = %+.3f', ...
+                     nanmean(fold_auc),nanmean(fold_mcc)), ...
+    'EdgeColor','k','BackgroundColor','w','FontSize',10.5, ...
+    'HorizontalAlignment','center');
+xlabel('False Positive Rate (FPR)','FontSize',12);
+ylabel('True Positive Rate (TPR)','FontSize',12);
+title('LOEO-SVM — ROC Curves','FontSize',13,'FontWeight','bold');
+legend('Location','southeast','FontSize',9);
+axis([0 1 0 1]); grid on; box on;
+set(gca,'GridAlpha',0.3,'FontSize',10);
+
+% Fig 3: Feature Importance
+fi_mean = nanmean(fold_fi,1)';
+fi_std  = nanstd(fold_fi,0,1)';
+[fi_sorted, fi_idx] = sort(fi_mean,'descend');
+top_n = min(15, N_FEAT);
+
+fig3 = figure('Name','Feature Importance', ...
+              'NumberTitle','off','Position',[120 50 950 520]);
+bar(1:top_n, fi_sorted(1:top_n), 0.7, 'FaceColor',[0.20 0.45 0.75]);
+hold on;
+errorbar(1:top_n, fi_sorted(1:top_n), fi_std(fi_idx(1:top_n)), ...
+         'k.','LineWidth',1.8,'CapSize',6);
+set(gca, 'XTick',            1:top_n, ...
+         'XTickLabel',        feat_disp(fi_idx(1:top_n)), ...
+         'XTickLabelRotation',45, ...
+         'FontSize',          9, ...
+         'GridAlpha',         0.3, ...
+         'TickLabelInterpreter','none');   % none: no tex parsing, no subscripts
+xlabel('Feature (GNSS Channel + Statistic)','FontSize',11);
+ylabel(['Permutation Importance (' D 'AUC)'],'FontSize',11);
+title({'Top 15 Most Important Features', ...
+       sprintf('LOEO Mean ± Std  (N=%d permutations)',N_PERM)}, ...
+      'FontSize',12,'FontWeight','bold');
+yline(0,'--k','LineWidth',1.2,'HandleVisibility','off');
+grid on; box on;
+
+% Fig 4: Day-Level SVM Anomaly Score
+fig4 = figure('Name','Day-Level SVM Anomaly Score', ...
+              'NumberTitle','off','Position',[50 50 1400 860]);
+
+for eq_i = 1:N_EQ
+    subplot(2,3,eq_i); hold on;
+
+    mask_eq = eq_ids == eq_i;
+    if ~any(mask_eq); continue; end
+
+    rng(SEED);
+    svm_fold = fitcsvm(X_feat(eq_ids~=eq_i,:), y_lbl(eq_ids~=eq_i), ...
+        'KernelFunction','rbf','BoxConstraint',SVM_C, ...
+        'KernelScale','auto','Standardize',true);
+    try; svm_fold = fitPosterior(svm_fold); catch; end
+
+    [~,sc_all] = predict(svm_fold, X_feat(mask_eq,:));
+    try
+        pc = find(svm_fold.ClassNames==1);
+        prob = sc_all(:,pc);
+    catch
+        prob = sc_all(:,end);
+    end
+
+    days_eq = day_vec(mask_eq);
+    stas_eq = sta_arr(mask_eq);
+    sta_uniq= unique(stas_eq);
+    sc_col  = lines(numel(sta_uniq));
+
+    for si = 1:numel(sta_uniq)
+        m  = strcmp(stas_eq, sta_uniq{si});
+        [ds,ord] = sort(days_eq(m));
+        ps = prob(m); ps = ps(ord);
+        plot(ds, ps,'-o','Color',sc_col(si,:),'LineWidth',2.0, ...
+             'MarkerSize',7,'DisplayName',sta_uniq{si});
+    end
+
+    yline(0.5,'--k','LineWidth',1.5,'HandleVisibility','off');
+    xline(0, '--r','LineWidth',2.0,'HandleVisibility','off');
+    xline(-2,':k', 'LineWidth',1.5,'HandleVisibility','off');
+
+    xlabel('Day (EQ = 0)','FontSize',10);
+    ylabel('SVM Anomaly Score','FontSize',10);
+    title(sprintf('%s\n(AUC=%.3f, MCC=%+.3f)', ...
+          catalog(eq_i).name, fold_auc(eq_i), fold_mcc(eq_i)), ...
+          'FontWeight','bold','FontSize',10);
+    legend('Location','best','FontSize',8);
+    ylim([0 1]);
+    set(gca,'XTick',-5:0,'GridAlpha',0.3,'FontSize',9);
+    grid on; box on;
+end
+
+sgtitle('Day-Level SVM Anomaly Score (LOEO)', ...
+        'FontSize',14,'FontWeight','bold');
+
+%% --- §7. SAVE ALL OUTPUTS -----------------------------------------------
+fprintf('\n=== §7: Saving outputs ===\n');
+
+save('EQ_Precursor_Workspace.mat');
+fprintf('  Workspace     : EQ_Precursor_Workspace.mat\n');
+
+out_xlsx = 'EQ_Precursor_Results.xlsx';
+
+T_perf = table({catalog.name}', fold_auc, fold_mcc, ...
+    'VariableNames',{'Earthquake','AUC','MCC'});
+T_perf = [T_perf; table({'MEAN'}, nanmean(fold_auc), nanmean(fold_mcc), ...
+    'VariableNames',{'Earthquake','AUC','MCC'})];
+writetable(T_perf, out_xlsx, 'Sheet','Performance');
+fprintf('  Excel (perf)  : %s\n', out_xlsx);
+
+T_fi = table(feat_names(fi_idx(1:top_n))', fi_sorted(1:top_n), ...
+             fi_std(fi_idx(1:top_n)), ...
+    'VariableNames',{'Feature','Importance_Mean','Importance_Std'});
+writetable(T_fi, out_xlsx, 'Sheet','Feature_Importance');
+fprintf('  Excel (feat)  : %s\n', out_xlsx);
+
+T_anom = table(anomaly_eq', anomaly_sta', anomaly_ch', ...
+               anomaly_tail(:,1), anomaly_tail(:,2), anomaly_tail(:,3), ...
+               anomaly_dec(:,1),  anomaly_dec(:,2),  anomaly_dec(:,3), ...
+    'VariableNames',{'Earthquake','Station','Channel', ...
+                     'TailP_Day-2','TailP_Day-1','TailP_Day0', ...
+                     'Anomaly_Day-2','Anomaly_Day-1','Anomaly_Day0'});
+writetable(T_anom, out_xlsx, 'Sheet','Anomaly_Decisions');
+fprintf('  Excel (anom)  : %s\n', out_xlsx);
+
+savefig(fig1, 'Fig1_SKLD_Timeline.fig');
+savefig(fig2, 'Fig2_ROC_Curves.fig');
+savefig(fig3, 'Fig3_Feature_Importance.fig');
+savefig(fig4, 'Fig4_SVM_Score_per_Day.fig');
+fprintf('  Figures saved (.fig)\n');
+fprintf('\n=== Done ===\n');
+
+%% ================================================================
+%  LOCAL FUNCTIONS  
+%% ================================================================
+
+function d = compute_skld(x, y, n_bins)
+    x = x(isfinite(x));
+    y = y(isfinite(y));
+    if numel(x)<2 || numel(y)<2; d=NaN; return; end
+    lo = min([x;y]); hi = max([x;y]);
+    if lo==hi; d=0; return; end
+    edges = linspace(lo,hi,n_bins+1);
+    ph = histcounts(x,edges,'Normalization','probability') + 1e-10;
+    qh = histcounts(y,edges,'Normalization','probability') + 1e-10;
+    ph = ph/sum(ph); qh = qh/sum(qh);
+    d  = sum(ph.*log(ph./qh)) + sum(qh.*log(qh./ph));
+end
+
+function mcc = compute_mcc(y_true, y_pred)
+    y_true = double(y_true==1);
+    y_pred = double(y_pred==1);
+    TP = sum(y_true==1 & y_pred==1);
+    TN = sum(y_true==0 & y_pred==0);
+    FP = sum(y_true==0 & y_pred==1);
+    FN = sum(y_true==1 & y_pred==0);
+    denom = sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN));
+    if denom==0; mcc=0; else; mcc=(TP*TN-FP*FN)/denom; end
+end
